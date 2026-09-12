@@ -566,7 +566,7 @@ pub trait RunStore: Send + Sync {
 /// is rejected up front (fail closed). Client-generated ids are
 /// `tr-<32hex>`, well inside this set.
 pub fn valid_trace_id(trace_id: &str) -> bool {
-    !trace_id.is_empty()
+    !trace_id.trim_matches('.').is_empty()
         && trace_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))
@@ -1951,6 +1951,13 @@ pub mod conformance_tests {
                 trace_id: "tr-abc123".to_string()
             }
         );
+
+        // All-dot ids are their own traversal hazard ("."/"..") and are
+        // rejected by the same clause that guards the charset.
+        assert!(!valid_trace_id("."));
+        assert!(!valid_trace_id(".."));
+        assert!(!valid_trace_id("..."));
+        assert!(valid_trace_id("tr-ok.1_x~"));
 
         // Charset validation: ids with path separators are rejected (the id
         // reaches document ids + artifact path segments).

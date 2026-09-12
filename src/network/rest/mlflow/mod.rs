@@ -1757,6 +1757,53 @@ mod tests {
             "masked PATCH must not drop unmasked fields",
         );
 
+        // REAL client shape the review proved uncovered (round 2 MAJOR-1):
+        // protobuf JSON camelCases FieldMask segments — "assessmentName".
+        let (status, body) = request_json(
+            &mut router,
+            "PATCH",
+            &format!("/api/3.0/mlflow/traces/tr-abc123def456/assessments/{assessment_id}"),
+            serde_json::json!({
+                "assessment": {"assessment_name": "renamed-camel"},
+                "update_mask": "assessmentName",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "camelCase mask body: {body}");
+        assert_eq!(body["assessment"]["assessment_name"], "renamed-camel");
+
+        // MAJOR-2: repeated query keys (trace_ids=a&trace_ids=b).
+        let (status, body) = get_json(
+            &mut router,
+            "/api/3.0/mlflow/traces/batchGet?trace_ids=tr-abc123def456&trace_ids=tr-none",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "repeated-key batchGet: {body}");
+        assert_eq!(
+            body["traces"].as_array().unwrap().len(),
+            1,
+            "absent ids skipped"
+        );
+
+        // NIT-3: create with a caller-supplied EXISTING id is a 409.
+        let (status, _) = post_json(
+            &mut router,
+            "/api/3.0/mlflow/traces/tr-abc123def456/assessments",
+            serde_json::json!({
+                "assessment": {
+                    "assessment_id": assessment_id,
+                    "assessment_name": "duplicate-id",
+                    "feedback": {"value": 1},
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "caller-supplied existing id must 409"
+        );
+
         // Identity/source/span and the assessment value kind are immutable.
         for immutable_path in ["span_id", "source", "trace_id", "assessment_id"] {
             let (status, _) = request_json(
@@ -2197,6 +2244,44 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+
+        // Sub-directory listings report OWNER-ROOT-relative paths: the
+        // returned "sub/model.bin" resolves against the response root_uri.
+        // The file is written THROUGH the artifacts proxy so the test
+        // stays layout-agnostic (the hardened store's on-disk tenant
+        // encoding is an implementation detail).
+        use axum::http::Method;
+        let put = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "/api/2.0/mlflow-artifacts/artifacts/{experiment_id}/models/{model_id}/artifacts/sub/nested.bin"
+                    ))
+                    .body(Body::from("x")).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let (status, body) = get_json(
+            &mut router,
+            &format!(
+                "/api/2.0/mlflow/logged-models/{model_id}/artifacts/directories?artifact_directory_path=sub"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "sub listing body: {body}");
+        let paths: Vec<String> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["path"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "sub/nested.bin"),
+            "owner-root-relative paths expected, got {paths:?}"
+        );
 
         // Soft delete: hidden from get+search, visible with allow_deleted.
         let (status, _) = request_json(
