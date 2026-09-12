@@ -419,14 +419,27 @@ def main() -> int:
     step("assessment_update_camel_mask", do_assessment_update, gen=3)
 
     def do_batch_get_traces():
-        # The client's batch-get sends repeated query keys
-        # (trace_ids=a&trace_ids=b) — the round-2 MAJOR-2 shape (the
-        # public entry point lives on the tracing client).
+        # Two layers: the client's batch flow (batchGetInfos POST + span
+        # download via the artifact repo), and the GET /traces/batchGet
+        # route with REPEATED query keys hit directly — the round-2
+        # MAJOR-2 shape the client library never sends on this code path
+        # (no spansLocation tag), so the raw request is what pins the
+        # parser.
         traces = client._tracing_client.batch_get_traces(
             [state["trace_id"], "tr-doesnotexist"]
         )
         by_id = {t.info.request_id for t in traces}
         assert state["trace_id"] in by_id, by_id
+        import requests
+
+        response = requests.get(
+            f"{tracking_uri.rstrip('/')}/api/3.0/mlflow/traces/batchGet",
+            params={"trace_ids": [state["trace_id"], "tr-doesnotexist"]},
+            timeout=30,
+        )
+        assert response.status_code == 200, (response.status_code, response.text)
+        fetched = {t["trace_info"]["trace_id"] for t in response.json()["traces"]}
+        assert state["trace_id"] in fetched, fetched
 
     step("batch_get_traces_repeated_keys", do_batch_get_traces, gen=3)
 

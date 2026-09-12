@@ -495,10 +495,12 @@ pub(super) async fn list_directory(
     // the display prefix, so "sub/model.bin" resolves against the
     // response's root_uri, not the tenant repo root. An empty sub (the
     // owner root itself) lists unprefixed.
-    let display = if display_sub.is_empty() {
-        String::new()
-    } else {
-        sanitize_segments(display_sub)?.join("/")
+    // A display_sub of only dots (".") is the owner root itself, mirroring
+    // the caller's segment filter — list unprefixed, not a 400.
+    let display = match sanitize_segments(display_sub) {
+        Ok(segments) => segments.join("/"),
+        Err(_) if display_sub.chars().all(|c| c == '.' || c.is_whitespace()) => String::new(),
+        Err(e) => return Err(e),
     };
     let entries = ArtifactStore::new(state, tenant)?.list(segments).await?;
     Ok(artifact_entries_json(entries, &display))

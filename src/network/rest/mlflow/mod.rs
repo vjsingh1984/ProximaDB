@@ -2245,6 +2245,44 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
+        // Sub-directory listings report OWNER-ROOT-relative paths: the
+        // returned "sub/model.bin" resolves against the response root_uri.
+        // The file is written THROUGH the artifacts proxy so the test
+        // stays layout-agnostic (the hardened store's on-disk tenant
+        // encoding is an implementation detail).
+        use axum::http::Method;
+        let put = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "/api/2.0/mlflow-artifacts/artifacts/{experiment_id}/models/{model_id}/artifacts/sub/nested.bin"
+                    ))
+                    .body(Body::from("x")).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let (status, body) = get_json(
+            &mut router,
+            &format!(
+                "/api/2.0/mlflow/logged-models/{model_id}/artifacts/directories?artifact_directory_path=sub"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "sub listing body: {body}");
+        let paths: Vec<String> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["path"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "sub/nested.bin"),
+            "owner-root-relative paths expected, got {paths:?}"
+        );
+
         // Soft delete: hidden from get+search, visible with allow_deleted.
         let (status, _) = request_json(
             &mut router,
