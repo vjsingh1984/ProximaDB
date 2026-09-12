@@ -41,18 +41,11 @@ fn free_port() -> u16 {
 
 struct AuthTestServer {
     rest_port: u16,
+    grpc_port: u16,
+    flight_port: u16,
+    api_key: String,
     db: Option<ProximaDB>,
     _tmp: TempDir,
-}
-
-impl Drop for AuthTestServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
 }
 
 impl AuthTestServer {
@@ -60,6 +53,17 @@ impl AuthTestServer {
     /// default). `true` boots posture B: coordinator present, authentication
     /// flag off, one API key configured.
     async fn start(security_enabled: bool) -> anyhow::Result<Self> {
+        Self::start_with(security_enabled, |_| {}).await
+    }
+
+    async fn shutdown(mut self) -> anyhow::Result<()> {
+        if let Some(mut db) = self.db.take() {
+            db.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    fn config(security_enabled: bool) -> anyhow::Result<(Config, TempDir, String)> {
         let rest_port = free_port();
         let grpc_port = free_port();
         let pg_port = free_port();
@@ -73,11 +77,21 @@ impl AuthTestServer {
         config.api.grpc_port = grpc_port;
         config.api.unified_mode = false;
         config.api.pg_port = Some(pg_port);
+        config.api.enable_pgwire = false;
+        config.api.arrow_flight_port = free_port();
+        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
+            url: format!("file://{}", tmp.path().display()),
+            ..Default::default()
+        }];
+        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
+        config.storage.wal_config.write_buffer_directory =
+            format!("file://{}/wal", tmp.path().display());
+        let api_key = uuid::Uuid::new_v4().to_string();
 
         if security_enabled {
             let mut api_keys = std::collections::HashMap::new();
             api_keys.insert(
-                "td-auth-fc-test-key".to_string(),
+                api_key.clone(),
                 ApiKeyInfo {
                     user_id: "auth-fc-tester".to_string(),
                     tenant_id: Some("default-tenant".to_string()),
@@ -145,8 +159,31 @@ impl AuthTestServer {
             });
         }
 
+        Ok((config, tmp, api_key))
+    }
+
+    async fn start_with(
+        security_enabled: bool,
+        configure: impl FnOnce(&mut Config),
+    ) -> anyhow::Result<Self> {
+        let (mut config, tmp, api_key) = Self::config(security_enabled)?;
+        configure(&mut config);
+        let rest_port = config.api.rest_port;
+        let grpc_port = if config.api.unified_mode {
+            config.api.unified_port
+        } else {
+            config.api.grpc_port
+        };
+        let flight_port = if config.api.unified_mode {
+            config.api.unified_port
+        } else {
+            config.api.arrow_flight_port
+        };
         let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
+        if let Err(error) = db.start().await {
+            db.shutdown().await?;
+            return Err(error);
+        }
 
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -165,20 +202,211 @@ impl AuthTestServer {
 
         Ok(Self {
             rest_port,
+            grpc_port,
+            flight_port,
+            api_key,
             db: Some(db),
             _tmp: tmp,
         })
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_failclosed_flight_wrapper_preserves_injected_coordinator() {
+    use arrow_flight::{Criteria, flight_service_client::FlightServiceClient};
+    use futures::TryStreamExt;
+    use proximadb::network::arrow_ipc::{ArrowFlightServer, service::ProximaFlightService};
+    use proximadb::network::multi_server::{BindTarget, ServiceProfile, SharedServices};
+    use std::sync::Arc;
+
+    let (config, _tmp, api_key) = AuthTestServer::config(true).expect("isolated config");
+    let coordinator = Arc::new(
+        proximadb::security::initialize_security(config.security.clone().expect("security"))
+            .await
+            .expect("coordinator"),
+    );
+    let (services, _) = SharedServices::new(
+        None,
+        &config.storage,
+        None,
+        Some(&config),
+        ServiceProfile::Embedded,
+    )
+    .await
+    .expect("shared services");
+    let service = ProximaFlightService::from_services(
+        services.record_ops.clone(),
+        services.record_ops.clone(),
+        services.vector_operations_service.clone(),
+        services.collection_service.clone(),
+        services.graph_service.clone(),
+    )
+    .with_security_coordinator(Some(coordinator));
+    let address = ([127, 0, 0, 1], config.api.arrow_flight_port).into();
+    // Deliberately do NOT repeat the service coordinator on the wrapper.
+    let server = ArrowFlightServer::new(BindTarget::Tcp(address), service);
+    let task = tokio::spawn(server.start());
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{address}")).expect("endpoint");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let channel = loop {
+        match endpoint.connect().await {
+            Ok(channel) => break channel,
+            Err(error) if std::time::Instant::now() >= deadline => {
+                task.abort();
+                panic!("Flight not ready: {error}");
+            }
+            Err(_) => sleep(Duration::from_millis(25)).await,
+        }
+    };
+    let mut client = FlightServiceClient::new(channel);
+    for key in [None, Some("invalid"), Some(api_key.as_str())] {
+        let mut request = tonic::Request::new(Criteria {
+            expression: Default::default(),
+        });
+        if let Some(key) = key {
+            request
+                .metadata_mut()
+                .insert("x-api-key", key.parse().expect("key"));
+        }
+        let result = client.list_flights(request).await;
+        if key == Some(api_key.as_str()) {
+            let mut stream = result.expect("valid credential").into_inner();
+            while stream.try_next().await.expect("Flight stream").is_some() {}
+        } else {
+            assert!(matches!(
+                result
+                    .expect_err("missing/invalid credential must be rejected")
+                    .code(),
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+            ));
+        }
+    }
+    task.abort();
+    assert!(task.await.expect_err("cancelled listener").is_cancelled());
+}
+
 #[test]
 fn auth_failclosed_posture_b_matrix() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("test runtime")
         .block_on(auth_failclosed_posture_b_matrix_impl());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_failclosed_grpc_and_flight_credentials_in_both_port_modes() {
+    use arrow_flight::{Criteria, flight_service_client::FlightServiceClient};
+    use futures::TryStreamExt;
+    use proximadb_proto::proximadb_v2::{
+        V2ListCollectionsRequest, proxima_record_service_client::ProximaRecordServiceClient,
+    };
+
+    for unified in [false, true] {
+        let server = AuthTestServer::start_with(true, |config| {
+            config.api.unified_mode = unified;
+            config.api.unified_port = config.api.rest_port;
+            config.api.internal_mux_port = Some(free_port());
+        })
+        .await
+        .expect("transport fixture");
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let collections_url = format!("http://127.0.0.1:{}/api/v2/collections", server.rest_port);
+        let collection_name = format!("auth_control_{}", uuid::Uuid::new_v4().simple());
+        let created = http
+            .post(&collections_url)
+            .header("Authorization", format!("Api-Key {}", server.api_key))
+            .json(&serde_json::json!({"name": collection_name, "dimension": 4}))
+            .send()
+            .await
+            .expect("create positive-control collection");
+        assert!(
+            created.status().is_success(),
+            "collection setup: {}",
+            created.text().await.expect("body")
+        );
+        let mut grpc =
+            ProximaRecordServiceClient::connect(format!("http://127.0.0.1:{}", server.grpc_port))
+                .await
+                .expect("gRPC connect");
+        let flight_channel = tonic::transport::Endpoint::from_shared(format!(
+            "http://127.0.0.1:{}",
+            server.flight_port
+        ))
+        .expect("Flight endpoint")
+        .connect()
+        .await
+        .expect("Flight connect");
+        let mut flight = FlightServiceClient::new(flight_channel);
+        let invalid = uuid::Uuid::new_v4().to_string();
+        for credential in [None, Some(invalid.as_str()), Some(server.api_key.as_str())] {
+            let mut query = tonic::Request::new(V2ListCollectionsRequest {
+                limit: None,
+                offset: None,
+            });
+            let mut list = tonic::Request::new(Criteria {
+                expression: Default::default(),
+            });
+            if let Some(key) = credential {
+                let value = format!("Api-Key {key}")
+                    .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+                    .unwrap();
+                query.metadata_mut().insert("authorization", value.clone());
+                list.metadata_mut().insert("authorization", value);
+            }
+            let rest_result = match credential {
+                Some(key) => http
+                    .get(&collections_url)
+                    .header("Authorization", format!("Api-Key {key}")),
+                None => http.get(&collections_url),
+            }
+            .send()
+            .await
+            .expect("REST credentials control");
+            let grpc_result = grpc.list_collections(query).await;
+            let flight_result = flight.list_flights(list).await;
+            if credential == Some(server.api_key.as_str()) {
+                assert!(rest_result.status().is_success());
+                assert!(
+                    grpc_result
+                        .expect("valid gRPC credential")
+                        .into_inner()
+                        .collections
+                        .iter()
+                        .any(|collection| collection
+                            .config
+                            .as_ref()
+                            .is_some_and(|config| config.name == collection_name))
+                );
+                flight_result
+                    .expect("valid Flight credential")
+                    .into_inner()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("Flight stream completion");
+            } else {
+                assert!(matches!(
+                    rest_result.status(),
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ));
+                assert!(matches!(
+                    grpc_result.expect_err("gRPC must deny").code(),
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                ));
+                assert!(matches!(
+                    flight_result.expect_err("Flight must deny").code(),
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                ));
+            }
+        }
+        server.shutdown().await.expect("transport shutdown");
+    }
 }
 
 async fn auth_failclosed_posture_b_matrix_impl() {
@@ -207,7 +435,7 @@ async fn auth_failclosed_posture_b_matrix_impl() {
     // ── 2. The SAME call with the configured API key SUCCEEDS. ──
     let status = http
         .get(format!("{base}/api/v2/collections"))
-        .header("Authorization", "Api-Key td-auth-fc-test-key")
+        .header("Authorization", format!("Api-Key {}", server.api_key))
         .send()
         .await
         .expect("authenticated call")
@@ -246,4 +474,47 @@ async fn auth_failclosed_posture_b_matrix_impl() {
         status.is_success(),
         "the dev default (no security) must stay open, got {status}"
     );
+    dev_server.shutdown().await.expect("dev shutdown");
+    server.shutdown().await.expect("authenticated shutdown");
+}
+
+#[tokio::test]
+async fn auth_failclosed_refuses_unbound_optional_listeners_before_binding() {
+    for mcp in [false, true] {
+        let port = free_port();
+        let (mut config, _tmp, _) = AuthTestServer::config(true).expect("isolated config");
+        if mcp {
+            config.api.mcp_port = Some(port);
+        } else {
+            config.api.enable_pgwire = true;
+            config.api.pg_port = Some(port);
+        }
+        let ports = [
+            config.api.rest_port,
+            config.api.grpc_port,
+            config.api.arrow_flight_port,
+            port,
+        ];
+        let mut db = ProximaDB::new(config).await.expect("database construction");
+        let error = db
+            .start()
+            .await
+            .expect_err("unbound listener must not be admitted");
+        assert!(
+            error
+                .to_string()
+                .contains(if mcp { "MCP" } else { "pgwire" }),
+            "{error:#}"
+        );
+        // Check BEFORE shutdown: cleanup must not hide a partial startup.
+        for port in ports {
+            assert!(
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err(),
+                "rejected configuration bound port {port} before validation"
+            );
+        }
+        db.shutdown().await.expect("rejected database cleanup");
+    }
 }

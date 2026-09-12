@@ -401,7 +401,10 @@ impl RestServer {
         // auth on.  Single-tenant production deployments that forget to wire
         // auth would otherwise silently accept unauthenticated requests; the
         // warning makes the foot-gun visible at server start.
-        if !security_config.development_mode && !security_config.auth.enabled {
+        if !security_config.development_mode
+            && !security_config.auth.enabled
+            && security_coordinator.is_none()
+        {
             tracing::warn!(
                 target: "proximadb::security",
                 bind_addr = %bind_addr,
@@ -606,7 +609,7 @@ impl RestServer {
         // CLOSED — the deny layer applied after the router is built rejects the
         // data plane with 503. (Computed before the coordinator is moved below.)
         let auth_misconfigured = security_config.auth.enabled && security_coordinator.is_none();
-        let auth_layer = if security_config.auth.enabled {
+        let auth_layer = if security_config.auth.enabled || security_coordinator.is_some() {
             if let Some(coordinator) = security_coordinator {
                 Some(middleware::from_fn_with_state(
                     coordinator,

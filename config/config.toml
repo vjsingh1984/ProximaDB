@@ -154,6 +154,8 @@ filter_first_max_selectivity = 0.1
 vector_first_min_selectivity = 0.5
 
 [api]
+# Local single-tenant development only. Set false before enabling [security].
+enable_pgwire = true
 # Unified Port Mode - all protocols on single port
 unified_mode = true
 

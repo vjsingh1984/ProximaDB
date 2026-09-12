@@ -305,6 +305,11 @@ jobs:
             # the #1430 lesson, where a recall lane skipped on the very PR that
             # broke recall because the changed path matched no filter.
             authz_changes:
+              - 'src/database.rs'
+              - 'src/network/**'
+              - 'crates/foundation/proximadb-config/**'
+              - 'crates/platform/proximadb-runtime/**'
+              - 'tests/auth_failclosed_e2e.rs'
               - 'src/security/**'
               - 'src/services/operations/vectors/**'
               - 'crates/control/proximadb-abac/**'
@@ -2058,6 +2063,8 @@ jobs:
     name: Rust Integration Tests (authz e2e)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      RUST_MIN_STACK: "8388608"
     # `needs: [changes]` ONLY — deliberately not `rust-build`. `rust-build` is
     # itself gated on the `rust` filter (src/**, crates/**, apps/**, Cargo*),
     # so depending on it makes this lane inherit that gate transitively and skip
@@ -2099,7 +2106,7 @@ jobs:
           # is swallowed and the job reports red with no diagnostic — which is
           # exactly what happened on the first run of this lane.
           status=0
-          output=$(cargo test --features abac-policy --test abac_relational_transport_e2e -- --test-threads=1 --nocapture 2>&1) || status=$?
+          output=$(cargo test --features abac-policy --test abac_relational_transport_e2e --test auth_failclosed_e2e -- --test-threads=1 --nocapture 2>&1) || status=$?
           echo "$output"
           if echo "$output" | grep -qE "running 0 tests"; then
             echo "::error::the authz e2e suite compiled to ZERO tests - the abac-policy feature is not enabled, so this job verified nothing."

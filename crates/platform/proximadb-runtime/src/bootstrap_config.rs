@@ -205,9 +205,7 @@ impl Default for PostgresServerConfig {
     fn default() -> Self {
         Self {
             port: 5433, // Use 5433 to avoid conflict with real PostgreSQL
-            bind_address: "0.0.0.0:5433"
-                .parse()
-                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 5433))),
+            bind_address: SocketAddr::from(([127, 0, 0, 1], 5433)),
             enable_postgres: true,
             max_connections: 100,
             idle_timeout_secs: 3600,
@@ -652,13 +650,82 @@ impl TLSConfig {
 
     /// Get bind address for given port
     pub fn bind_address(&self, port: u16) -> SocketAddr {
-        format!("{}:{}", self.bind_interface, port)
+        self.bind_interface
             .parse()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)))
+            .map(|ip| SocketAddr::new(ip, port))
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)))
     }
 }
 
+/// Admission for surfaces without request-bound credentials and permissions.
+/// TLS or a caller-supplied tenant assertion cannot substitute for those.
+pub fn validate_trust_only_listener(
+    surface: &str,
+    address: SocketAddr,
+    coordinator_present: bool,
+    mode: &proximadb_tenant::TenantDeploymentMode,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !coordinator_present
+            && matches!(
+                mode,
+                proximadb_tenant::TenantDeploymentMode::SingleTenant { .. }
+            )
+            && address.ip().is_loopback(),
+        "{surface} currently supports only unauthenticated single-tenant loopback access; \
+         disable this listener in authenticated, multi-tenant, or non-loopback deployments"
+    );
+    Ok(())
+}
+
 impl MultiServerConfig {
+    /// Validate the entire listener set before binding any of its sockets.
+    pub fn validate_listener_security(
+        &self,
+        coordinator_present: bool,
+        mode: &proximadb_tenant::TenantDeploymentMode,
+    ) -> anyhow::Result<()> {
+        self.tls_config
+            .bind_interface
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| anyhow::anyhow!("invalid HTTP bind interface"))?;
+        if self.is_unified_mode() {
+            self.unified_bind_address
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| anyhow::anyhow!("invalid unified bind interface"))?;
+        }
+        anyhow::ensure!(
+            coordinator_present
+                || !matches!(mode, proximadb_tenant::TenantDeploymentMode::MultiTenant),
+            "multi-tenant network serving requires a security coordinator"
+        );
+        if self.postgres_config.enable_postgres {
+            anyhow::ensure!(
+                !self.is_uds_mode(),
+                "pgwire must be disabled in portless mode"
+            );
+            validate_trust_only_listener(
+                "pgwire",
+                self.postgres_config.active_bind_address(),
+                coordinator_present,
+                mode,
+            )?;
+        }
+        if let Some(port) = self.api_config.as_ref().and_then(|api| api.mcp_port) {
+            anyhow::ensure!(
+                !self.is_uds_mode(),
+                "MCP TCP listener must be disabled in portless mode"
+            );
+            validate_trust_only_listener(
+                "MCP",
+                SocketAddr::new(self.http_bind_address().ip(), port),
+                coordinator_present,
+                mode,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Get effective bind address for HTTP server
     pub fn http_bind_address(&self) -> SocketAddr {
         self.tls_config.bind_address(self.http_config.port)
@@ -671,13 +738,10 @@ impl MultiServerConfig {
 
     /// Get effective bind address for unified port mode
     pub fn unified_bind_address(&self) -> SocketAddr {
-        format!("{}:{}", self.unified_bind_address, self.unified_port)
+        self.unified_bind_address
             .parse()
-            .unwrap_or_else(|_| {
-                format!("0.0.0.0:{}", self.unified_port)
-                    .parse()
-                    .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], self.unified_port)))
-            })
+            .map(|ip| SocketAddr::new(ip, self.unified_port))
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], self.unified_port)))
     }
 
     /// Resolve where the REST surface should listen. Returns a Unix-domain
@@ -742,6 +806,86 @@ pub struct ServerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_only_listener_rejects_shared_or_authenticated_deployment() {
+        let local = SocketAddr::from(([127, 0, 0, 1], 5433));
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        for surface in ["pgwire", "MCP"] {
+            assert!(validate_trust_only_listener(surface, local, false, &single).is_ok());
+            assert!(validate_trust_only_listener(surface, local, true, &single).is_err());
+            assert!(
+                validate_trust_only_listener(
+                    surface,
+                    local,
+                    false,
+                    &proximadb_tenant::TenantDeploymentMode::MultiTenant
+                )
+                .is_err()
+            );
+            for address in [
+                "0.0.0.0:5433",
+                "192.0.2.1:5433",
+                "[::]:5433",
+                "[::ffff:192.0.2.1]:5433",
+            ] {
+                assert!(
+                    validate_trust_only_listener(surface, address.parse().unwrap(), false, &single)
+                        .is_err()
+                );
+            }
+            assert!(
+                validate_trust_only_listener(
+                    surface,
+                    "[::1]:5433".parse().unwrap(),
+                    false,
+                    &single
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn listener_preflight_checks_optional_surfaces_before_startup() {
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        let mut config = MultiServerConfig::default();
+        config.postgres_config.bind_address = SocketAddr::from(([127, 0, 0, 1], 5433));
+        assert!(config.validate_listener_security(true, &single).is_err());
+        config.postgres_config.enable_postgres = false;
+        assert!(config.validate_listener_security(true, &single).is_ok());
+        config.api_config = Some(proximadb_config::ApiConfig {
+            mcp_port: Some(5700),
+            ..Default::default()
+        });
+        assert!(config.validate_listener_security(true, &single).is_err());
+        config.api_config = None;
+        assert!(
+            config
+                .validate_listener_security(
+                    false,
+                    &proximadb_tenant::TenantDeploymentMode::MultiTenant
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn listener_preflight_preserves_local_mcp_but_not_portless_tcp() {
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        let mut config = MultiServerConfig::default();
+        config.postgres_config.enable_postgres = false;
+        config.tls_config.bind_interface = "127.0.0.1".into();
+        config.api_config = Some(proximadb_config::ApiConfig {
+            mcp_port: Some(5700),
+            ..Default::default()
+        });
+        assert!(config.validate_listener_security(false, &single).is_ok());
+        config.uds_socket_dir = Some(PathBuf::from("unused-test-sockets"));
+        assert!(config.validate_listener_security(false, &single).is_err());
+        config.api_config.as_mut().unwrap().mcp_port = None;
+        assert!(config.validate_listener_security(false, &single).is_ok());
+    }
 
     #[test]
     fn test_server_config_defaults() {

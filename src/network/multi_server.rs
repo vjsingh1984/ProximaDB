@@ -112,8 +112,8 @@ pub struct MultiServer {
     /// Shared services accessible for WAL recovery during startup
     pub shared_services: SharedServices,
     security_coordinator: Option<Arc<SecurityCoordinator>>,
-    rest_auth_enabled: bool,
     tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode,
+    authentication_required: bool,
     server_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// LLM engine for semantic operations
     llm_engine: Option<Arc<crate::ai::llm_integration::LLMIntegrationEngine>>,
@@ -135,6 +135,17 @@ pub struct MultiServer {
 }
 
 impl MultiServer {
+    fn validate_listener_security(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.authentication_required || self.security_coordinator.is_some(),
+            "authentication is required but no security coordinator is configured"
+        );
+        self.config.validate_listener_security(
+            self.security_coordinator.is_some(),
+            &self.tenant_deployment_mode,
+        )
+    }
+
     /// Construct the always-on canonical v2 **record** gRPC service.
     ///
     /// Centralized so every server-startup entrypoint (`start`, `start_unified`,
@@ -293,7 +304,7 @@ impl MultiServer {
             config,
             shared_services,
             security_coordinator,
-            rest_auth_enabled,
+            authentication_required: rest_auth_enabled,
             tenant_deployment_mode,
             server_handles: Arc::new(Mutex::new(Vec::new())),
             llm_engine,
@@ -450,10 +461,8 @@ impl MultiServer {
         ));
         let addr = SocketAddr::new(self.config.http_bind_address().ip(), mcp_port);
         info!("🧠 In-process reference MCP surface enabled on {addr}");
-        // TD-AUTH-FC (D3): thread the coordinator so MCP enforces the same
-        // credential posture as REST/gRPC/Flight when a security subsystem is
-        // active (the surface is fully privileged; it previously served
-        // unauthenticated JSON-RPC whenever the port was configured).
+        // Defense in depth: the standalone MCP entrypoint also refuses
+        // authenticated composition until its tool port carries identity.
         let mcp_coordinator = self.security_coordinator.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::network::mcp::serve(addr, backend, mcp_coordinator).await {
@@ -467,6 +476,7 @@ impl MultiServer {
     /// In unified mode: All protocols (REST, gRPC, Arrow Flight) on single port (default 5678)
     /// In legacy mode: gRPC on 5679, Arrow IPC on 5680, REST on 5678 (separate ports)
     pub async fn start(&mut self) -> Result<()> {
+        self.validate_listener_security()?;
         // In-process reference MCP transport (ADR-037 Decision 5). Bound only when
         // `[api].mcp_port` is configured (off by default) — spawned here, before the
         // unified/legacy branch, so it runs regardless of port mode. The backend
@@ -1024,6 +1034,7 @@ impl MultiServer {
     /// This approach works around http crate version incompatibilities between
     /// axum 0.6 (http 0.2) and tonic 0.14 (http 1.x) by routing at the TCP level.
     async fn start_unified(&mut self) -> Result<()> {
+        self.validate_listener_security()?;
         let unified_addr = self.config.unified_bind_address();
         info!(
             "🚀 Starting ProximaDB Unified Server on {} (REST + gRPC + Arrow Flight via TCP multiplexing)",
@@ -1520,6 +1531,11 @@ impl MultiServer {
         replication: Arc<RwLock<EngineReplication>>,
         node_id: String,
     ) -> Result<()> {
+        self.validate_listener_security()?;
+        anyhow::ensure!(
+            self.security_coordinator.is_none(),
+            "authenticated cluster RPC clients are not implemented; refusing cluster startup"
+        );
         info!("Starting ProximaDB Multi-Server with Cluster Services");
         info!(
             "  Node ID: {}, Consensus: enabled, Replication: enabled, Health: enabled",
@@ -1642,7 +1658,7 @@ impl MultiServer {
                 ));
 
             // Standard grpc.health.v1.Health service for k8s/LB probes.
-            let (mut std_health_reporter, standard_health_server) =
+            let (std_health_reporter, standard_health_server) =
                 tonic_health::server::health_reporter();
             std_health_reporter
                 .set_service_status("", tonic_health::ServingStatus::Serving)

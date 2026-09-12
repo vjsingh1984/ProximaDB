@@ -22,27 +22,21 @@ use proximadb_mcp::{JsonRpcRequest, handle_request};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-/// Build the MCP HTTP router over the given backend (`POST /` and `POST /mcp`).
-/// Build the MCP router. `security_coordinator` (TD-AUTH-FC): when present,
-/// the SAME `auth_middleware_unified` REST uses is attached — MCP is a fully
-/// privileged data-plane surface and no longer serves unauthenticated JSON-RPC
-/// when a security subsystem is active. `None` ⇒ unauthenticated (dev
-/// posture; `api.mcp_port` defaults off).
-pub fn router(
+/// Build the local-only MCP router. Authenticated deployments are refused
+/// until the tool port consumes request-bound tenant identity and permissions.
+fn router(
     backend: Arc<EngineBackend>,
     security_coordinator: Option<std::sync::Arc<crate::security::SecurityCoordinator>>,
-) -> Router {
+) -> anyhow::Result<Router> {
+    anyhow::ensure!(
+        security_coordinator.is_none(),
+        "MCP has no request-bound authorization; disable api.mcp_port when security is enabled"
+    );
     let router = Router::new()
         .route("/", post(rpc))
         .route("/mcp", post(rpc))
         .with_state(backend);
-    match security_coordinator {
-        Some(coordinator) => router.layer(axum::middleware::from_fn_with_state(
-            coordinator,
-            crate::network::auth::middleware::auth_middleware_unified,
-        )),
-        None => router,
-    }
+    Ok(router)
 }
 
 async fn rpc(State(backend): State<Arc<EngineBackend>>, body: String) -> Json<Value> {
@@ -72,16 +66,18 @@ pub async fn serve(
     backend: Arc<EngineBackend>,
     security_coordinator: Option<std::sync::Arc<crate::security::SecurityCoordinator>>,
 ) -> anyhow::Result<()> {
+    proximadb_runtime::bootstrap_config::validate_trust_only_listener(
+        "MCP",
+        addr,
+        security_coordinator.is_some(),
+        &proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
+    )?;
+    let router = router(backend, security_coordinator)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
-        "MCP reference surface listening on {addr} (MCP {}; auth: {})",
+        "MCP local reference surface listening on {addr} (MCP {})",
         proximadb_mcp::MCP_PROTOCOL_VERSION,
-        if security_coordinator.is_some() {
-            "coordinator"
-        } else {
-            "none (dev posture)"
-        }
     );
-    axum::serve(listener, router(backend, security_coordinator)).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }

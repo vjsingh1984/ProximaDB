@@ -8,7 +8,7 @@
 //! journey:
 //!
 //! ```text
-//! pgwire setup + trust-auth SELECT ----+
+//! authenticated SQL setup + SELECT ---+
 //!                                      v
 //! authenticated gRPC ExecuteQuery -> relational DML scan
 //! authenticated REST /api/v2/sql ----> shared typed SQL port
@@ -20,10 +20,11 @@
 //! ```
 //!
 //! The test proves deny-before-provision, hot permit without reconnect/restart,
-//! isolation of an unbound subject, and hot revoke over trust-auth pgwire and
+//! isolation of an unbound subject, and hot revoke over authenticated SQL and
 //! the credential-authenticated REST, gRPC, and Flight transports. It also
-//! discovers the table's stable object id through `xcatalog.tables`; policy
-//! tooling must never guess an allocator result or scrape catalog persistence.
+//! obtains the table's stable object id through canonical read-only replay of
+//! the isolated fixture's catalog WAL. This is test setup, not policy tooling:
+//! authenticated relational catalog introspection remains a capability gap.
 
 #![cfg(feature = "abac-policy")]
 
@@ -54,10 +55,9 @@ use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::sleep;
-use tokio_postgres::{Client as PgClient, SimpleQueryMessage};
 
 // The composition root mints this catalog tenant before listeners start, so the
-// pgwire handshake can stamp its stable id once and retain it for the session.
+// authenticated request can resolve the same stable tenant id.
 const TENANT: &str = proximadb_tenant::DEFAULT_TENANT;
 const OPERATOR_KEY: &str = "abac-operator-key";
 const ALICE_KEY: &str = "abac-alice-key";
@@ -172,6 +172,7 @@ impl LiveServer {
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", tmp.path().display());
         config.security = Some(transport_security_config());
+        config.api.enable_pgwire = false;
 
         let mut db = ProximaDB::new(config).await?;
         db.start().await?;
@@ -231,68 +232,91 @@ impl Drop for LiveServer {
     }
 }
 
-async fn connect(server: &LiveServer, subject: &str) -> PgClient {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let (client, connection) = loop {
-        match tokio_postgres::connect(&server.pg_conn_str(subject), tokio_postgres::NoTls).await {
-            Ok(connection) => break connection,
-            Err(error) if std::time::Instant::now() < deadline => {
-                sleep(Duration::from_millis(100)).await;
-                tracing::debug!(%error, %subject, "waiting for pgwire listener");
-            }
-            Err(error) => panic!("connect {subject}: {error}"),
-        }
+struct AuthenticatedSqlClient {
+    http: HttpClient,
+    url: String,
+    key: &'static str,
+    catalog_wal: std::path::PathBuf,
+}
+
+async fn connect(server: &LiveServer, subject: &str) -> AuthenticatedSqlClient {
+    let key = match subject {
+        "alice" => ALICE_KEY,
+        "bob" => BOB_KEY,
+        "setup-operator" => OPERATOR_KEY,
+        _ => panic!("unknown fixture subject"),
     };
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            eprintln!("pgwire connection error: {error}");
-        }
-    });
-    client
-}
-
-async fn exec(client: &PgClient, sql: &str) {
-    client
-        .simple_query(sql)
-        .await
-        .unwrap_or_else(|error| panic!("execute `{sql}`: {error}"));
-}
-
-async fn scalar(client: &PgClient, sql: &str) -> String {
-    for message in client
-        .simple_query(sql)
-        .await
-        .unwrap_or_else(|error| panic!("query `{sql}`: {error}"))
-    {
-        if let SimpleQueryMessage::Row(row) = message {
-            return row.get(0).unwrap_or("NULL").to_string();
-        }
+    AuthenticatedSqlClient {
+        http: HttpClient::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap(),
+        url: server.admin_url("/api/v2/sql"),
+        key,
+        catalog_wal: server._tmp.path().join("metadata/system-catalog.wal"),
     }
-    panic!("query `{sql}` returned no row")
 }
 
-async fn table_object_id(client: &PgClient, table: &str) -> u64 {
-    let sql = format!("SELECT * FROM xcatalog.tables WHERE table_name = '{table}'");
-    // `resolve_table_scoped` avoids duplicating the tenant when the default
-    // namespace already equals it; introspection renders that namespace as the
-    // PostgreSQL-compatible `public` alias.
-    let expected_namespace = "public";
-    for message in client
-        .simple_query(&sql)
+async fn sql_response(client: &AuthenticatedSqlClient, sql: &str) -> Value {
+    let response = client
+        .http
+        .post(&client.url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Api-Key {}", client.key),
+        )
+        .header("x-tenant-id", TENANT)
+        .json(&json!({"query": sql}))
+        .send()
         .await
-        .unwrap_or_else(|error| panic!("catalog query `{sql}`: {error}"))
-    {
-        if let SimpleQueryMessage::Row(row) = message
-            && row.get(1) == Some(expected_namespace)
-        {
-            return row
-                .get(9)
-                .expect("xcatalog.tables object_id column")
-                .parse()
-                .expect("numeric stable table object id");
-        }
+        .expect("SQL request");
+    assert_admin_success(response, sql).await
+}
+
+async fn exec(client: &AuthenticatedSqlClient, sql: &str) {
+    sql_response(client, sql).await;
+}
+
+async fn scalar(client: &AuthenticatedSqlClient, sql: &str) -> String {
+    let response = sql_response(client, sql).await;
+    let column = response["columns"][0].as_str().expect("first column");
+    let value = &response["rows"][0][column];
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Null => "NULL".to_string(),
+        value => value.to_string(),
     }
-    panic!("catalog query did not return tenant-scoped table {expected_namespace}.{table}")
+}
+
+async fn table_object_id(client: &AuthenticatedSqlClient, table: &str) -> u64 {
+    // Fixture-only metadata lookup: xcatalog SQL introspection is pgwire-only.
+    // Replay the fresh local fixture's durable DDL without opening a second
+    // catalog writer or introducing an unauthenticated network setup channel.
+    // Policy/grant provisioning and every data read still use live credentials.
+    assert!(
+        client.catalog_wal.is_file(),
+        "fixture requires the local SystemCatalog backend"
+    );
+    assert!(
+        !client.catalog_wal.with_extension("snapshot").exists(),
+        "fresh fixture must not have checkpointed its catalog"
+    );
+    let entries =
+        proximadb::services::FramedTableWalAppender::read_entries_from_path(&client.catalog_wal)
+            .await
+            .expect("read fixture catalog WAL");
+    let catalog =
+        proximadb::services::system_catalog_state::SystemCatalogState::from_wal_entries(&entries)
+            .expect("replay fixture catalog");
+    let identifier = proximadb_catalog::TableIdentifier::new(vec![TENANT.to_string()], table);
+    let object_id = catalog
+        .get_table(&identifier)
+        .unwrap_or_else(|| panic!("catalog missing tenant-scoped {identifier:?}"))
+        .object_id
+        .expect("catalog-minted stable table object id");
+    assert!(object_id > 0, "catalog object id zero is reserved");
+    object_id
 }
 
 async fn assert_admin_success(response: reqwest::Response, operation: &str) -> Value {
@@ -832,18 +856,24 @@ async fn revoke_live_policy(client: &HttpClient, server: &LiveServer, policy_pat
 /// 8 MiB integration-test runtime so the test measures the transport contract,
 /// not debug-frame size (see `tpch_pgwire_e2e`).
 #[test]
-fn pgwire_reads_follow_live_rest_policy_provision_and_revoke() {
+fn authenticated_sql_counts_follow_live_policy_provision_and_revoke() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .expect("tokio runtime");
-    runtime.block_on(pgwire_reads_follow_live_rest_policy_provision_and_revoke_inner());
+    runtime.block_on(authenticated_sql_counts_follow_live_policy_provision_and_revoke_inner());
 }
 
-async fn pgwire_reads_follow_live_rest_policy_provision_and_revoke_inner() {
+async fn authenticated_sql_counts_follow_live_policy_provision_and_revoke_inner() {
     let server = LiveServer::start().await.expect("start live server");
+    assert!(
+        tokio_postgres::connect(&server.pg_conn_str("alice"), tokio_postgres::NoTls)
+            .await
+            .is_err(),
+        "authenticated fixture must not expose trust pgwire"
+    );
     let alice = connect(&server, "alice").await;
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -862,7 +892,7 @@ async fn pgwire_reads_follow_live_rest_policy_provision_and_revoke_inner() {
     let table_scope = u32::try_from(object_id).expect("ABAC table scope is u32");
 
     // Empty durable stores are deny-by-default. The request carries all four
-    // identity fields through real pgwire, but neither subject membership nor a
+    // identity fields through authenticated SQL, but neither subject membership nor a
     // table permit exists yet.
     assert_eq!(
         scalar(&alice, &format!("SELECT COUNT(*) FROM {table}")).await,
@@ -914,7 +944,7 @@ async fn pgwire_reads_follow_live_rest_policy_provision_and_revoke_inner() {
     assert_eq!(
         scalar(&alice, &format!("SELECT COUNT(*) FROM {table}")).await,
         "2",
-        "policy mutation must be hot-visible to the existing pgwire session"
+        "policy mutation must be hot-visible to the existing authenticated SQL client"
     );
 
     let bob = connect(&server, "bob").await;
@@ -938,15 +968,15 @@ async fn pgwire_reads_follow_live_rest_policy_provision_and_revoke_inner() {
     assert_eq!(
         scalar(&alice, &format!("SELECT COUNT(*) FROM {table}")).await,
         "0",
-        "policy revoke must be hot-visible to the existing pgwire session"
+        "policy revoke must be hot-visible to the existing authenticated SQL client"
     );
 }
 
 /// The protobuf programmatic SQL surface is authenticated gRPC
 /// `ProximaRecordService.ExecuteQuery`. Keep this as a separate live ratchet
-/// from pgwire and REST: gRPC obtains the subject
+/// from REST: gRPC obtains the subject
 /// from a verified API key and therefore proves the load-bearing authenticated
-/// carrier, not pgwire's deliberately trust-asserted user name.
+/// carrier. Trust-auth pgwire is not admitted on this authenticated fixture.
 #[test]
 fn grpc_reads_follow_live_rest_policy_provision_and_revoke() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -961,7 +991,7 @@ fn grpc_reads_follow_live_rest_policy_provision_and_revoke() {
 async fn grpc_reads_follow_live_rest_policy_provision_and_revoke_inner() {
     let server = LiveServer::start().await.expect("start live server");
 
-    // Use pgwire only as the setup/operator SQL surface. The assertions below
+    // Use authenticated REST SQL as the setup/operator surface. The assertions below
     // all cross the independently authenticated gRPC transport.
     let setup = connect(&server, "setup-operator").await;
     let suffix = std::time::SystemTime::now()
