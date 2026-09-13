@@ -32,6 +32,9 @@ pub struct MlflowState {
     run_store: std::sync::Arc<dyn proximadb_catalog::run_store::RunStoreFactory>,
     registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
     pub(crate) data_dir: std::path::PathBuf,
+    /// The artifact seam (TD-MLOPS-4): defaults to the hardened local
+    /// backend; a tracked-S3 implementation injects here.
+    pub(crate) artifacts: std::sync::Arc<dyn proximadb_catalog::run_store::ArtifactBackendFactory>,
 }
 
 impl MlflowState {
@@ -40,9 +43,14 @@ impl MlflowState {
         registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
         data_dir: std::path::PathBuf,
     ) -> Self {
+        let artifacts: std::sync::Arc<dyn proximadb_catalog::run_store::ArtifactBackendFactory> =
+            std::sync::Arc::new(artifacts::HardenedLocalBackendFactory::new(
+                data_dir.clone(),
+            ));
         Self {
             run_store,
             registry,
+            artifacts,
             data_dir,
         }
     }
