@@ -300,6 +300,12 @@ impl PostgresServer {
 
     /// Start the PostgreSQL server
     pub async fn start(&self) -> Result<()> {
+        proximadb_runtime::bootstrap_config::validate_trust_only_listener(
+            "pgwire",
+            self.bind_address,
+            false,
+            &self.tenant_deployment_mode,
+        )?;
         let listener = TcpListener::bind(self.bind_address).await?;
         info!("PostgreSQL server listening on {}", self.bind_address);
 

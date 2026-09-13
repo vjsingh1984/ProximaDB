@@ -71,12 +71,11 @@ fn serve_file_from(path: &str, cache: bool) -> Response {
     if let Ok(v) = header::HeaderValue::from_str(mime.as_ref()) {
         headers.insert(header::CONTENT_TYPE, v);
     }
-    if cache {
-        if let Ok(v) =
+    if cache
+        && let Ok(v) =
             header::HeaderValue::from_str(&format!("public, max-age={STATIC_CACHE_MAX_AGE}"))
-        {
-            headers.insert(header::CACHE_CONTROL, v);
-        }
+    {
+        headers.insert(header::CACHE_CONTROL, v);
     }
     (headers, Body::from(file.contents())).into_response()
 }

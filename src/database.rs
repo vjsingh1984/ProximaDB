@@ -600,6 +600,16 @@ impl ProximaDB {
         let rest_auth_enabled = security_config
             .as_ref()
             .is_some_and(|sec_cfg| sec_cfg.authentication.enabled);
+        // Coordinator presence requires credentials on REST/gRPC/Flight.
+        // MCP and pgwire lack request-bound authorization and are instead
+        // refused by listener preflight in authenticated deployments.
+        if security.is_some() && !rest_auth_enabled {
+            tracing::warn!(
+                "security subsystem active with authentication.enabled = false: \
+                 REST/gRPC/Arrow Flight require credentials. Disable api.enable_pgwire \
+                 and omit api.mcp_port until those surfaces support request-bound authorization."
+            );
+        }
         let tenant_deployment_mode =
             resolve_server_tenant_mode(&config.server.tenant, security_config.as_ref())?;
         // Capture the drainer's record + vector services BEFORE shared_services

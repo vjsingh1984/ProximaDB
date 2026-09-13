@@ -169,6 +169,7 @@ impl AuthTestServer {
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", tmp_data.path().display());
         config.security = Some(auth_config_with_dev_key());
+        config.api.enable_pgwire = false;
 
         let mut db = ProximaDB::new(config).await?;
         db.start().await?;

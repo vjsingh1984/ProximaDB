@@ -69,6 +69,21 @@ cross-surface REST/gRPC/Flight/pgwire admit/deny matrix passes.
 
 == Canonical API Surface
 
+[IMPORTANT]
+====
+Authenticated deployments require credentials on REST, gRPC and Arrow Flight
+whenever a security coordinator is configured, even if the legacy
+`security.authentication.enabled` flag is false.
+Until request-bound authorization is implemented, MCP and pgwire are restricted
+to unauthenticated, single-tenant loopback deployments. Set
+`[api] enable_pgwire = false` and omit `mcp_port` in authenticated deployments.
+Unsupported listener combinations are rejected before any listener is bound;
+multi-tenant serving without a security coordinator is also rejected.
+The default pgwire listener binds loopback, not all network interfaces.
+MCP remains off by default and cannot be enabled in portless (UDS) mode.
+These restrictions are containment, not a claim of authenticated MCP or pgwire support.
+====
+
 REST `/api/v2` is the **sole canonical REST surface** for all ProximaDB clients as of 2026-09-11.
 
 [IMPORTANT]
