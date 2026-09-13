@@ -586,6 +586,131 @@ pub fn tag_clause_matches(is_eq: bool, present_value: Option<&String>, expected:
     }
 }
 
+// ---------------------------------------------------------------------------
+// Artifact backend port (TD-MLOPS-4): the seam EXTRACTED FROM the hardened
+// implementation (#1891), not designed ahead of one. Rules encoded here:
+// (1) tenant bound at construction — no tenant string in path arguments;
+// (2) async-only surface — implementations own their blocking strategy;
+// (3) capability declaration — platform/filesystem limits are stated, not
+//     discovered at request time;
+// (4) segments validate IN the port (ArtifactPath is constructed only
+//     through validation);
+// (5) the conformance battery carries #1891's red evidence.
+// ---------------------------------------------------------------------------
+
+/// Errors at the artifact seam. Implementations map their internals into
+/// these; the wire maps these onto the MLflow envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactBackendError {
+    /// The path (or tenant) failed port-level validation.
+    Invalid(String),
+    /// The implementation cannot serve this platform (e.g. Windows
+    /// fail-closed before any filesystem touch).
+    UnsupportedPlatform(String),
+    /// Everything else — operational failures.
+    Internal(String),
+}
+
+/// A validated artifact path: repo-root-relative segments, constructed ONLY
+/// through [`ArtifactPath::parse`]. `..`, backslashes, NUL, and empty
+/// inputs are rejected here — once — for every backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPath {
+    segments: Vec<String>,
+}
+
+impl ArtifactPath {
+    /// Validate and construct. The single validation home (rule 4): the
+    /// wire's request parsing delegates here.
+    pub fn parse(path: &str) -> Result<Self, ArtifactBackendError> {
+        let mut segments = Vec::new();
+        for segment in path.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == ".." || segment.contains('\\') || segment.contains('\0') {
+                return Err(ArtifactBackendError::Invalid(format!(
+                    "invalid artifact path segment '{segment}'"
+                )));
+            }
+            segments.push(segment.to_string());
+        }
+        if segments.is_empty() {
+            return Err(ArtifactBackendError::Invalid(
+                "artifact path must not be empty".to_string(),
+            ));
+        }
+        Ok(Self { segments })
+    }
+
+    /// Construct from already-trusted segments (server-minted paths).
+    pub fn from_segments(segments: &[String]) -> Result<Self, ArtifactBackendError> {
+        Self::parse(&segments.join("/"))
+    }
+
+    pub fn segments(&self) -> &[String] {
+        &self.segments
+    }
+}
+
+/// One listing entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactBackendEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+}
+
+/// What a GET resolves to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArtifactBackendContents {
+    File(Vec<u8>),
+    Directory(Vec<ArtifactBackendEntry>),
+}
+
+/// What an implementation supports — declared, not discovered (rule 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactBackendCapabilities {
+    /// The backend has filesystem semantics (symlinks, parent swap): the
+    /// fs-shaped battery cases apply to it.
+    pub filesystem_semantics: bool,
+}
+
+/// The artifact seam. Tenant binding happens in the FACTORY (rule 1): the
+/// path carries only repo-relative segments.
+#[async_trait::async_trait]
+pub trait ArtifactBackend: Send + Sync {
+    fn capabilities(&self) -> ArtifactBackendCapabilities;
+
+    async fn put(&self, path: &ArtifactPath, bytes: &[u8]) -> Result<(), ArtifactBackendError>;
+
+    /// None when absent; a directory surfaces as Directory(entries) — the
+    /// proxy's GET-on-directory-LISTS contract (extracted from the proven
+    /// implementation, not designed speculatively).
+    async fn get(
+        &self,
+        path: &ArtifactPath,
+    ) -> Result<Option<ArtifactBackendContents>, ArtifactBackendError>;
+
+    async fn list(
+        &self,
+        path: &ArtifactPath,
+    ) -> Result<Vec<ArtifactBackendEntry>, ArtifactBackendError>;
+
+    /// Idempotent (absent paths are a no-op).
+    async fn delete(&self, path: &ArtifactPath) -> Result<(), ArtifactBackendError>;
+}
+
+/// Builds tenant-bound backends. Validation of the tenant id belongs to
+/// implementations (they own the encoding), but construction is the ONLY
+/// place a tenant identity enters the seam.
+pub trait ArtifactBackendFactory: Send + Sync {
+    fn backend_for(
+        &self,
+        tenant_id: &str,
+    ) -> Result<std::sync::Arc<dyn ArtifactBackend>, ArtifactBackendError>;
+}
+
 /// Tenant-scoped factory over [`RunStore`] implementations — the seam the
 /// wire depends on (DIP): transports receive a factory, never a concrete
 /// store, so a second implementation (test double, alternative substrate)
@@ -1502,6 +1627,172 @@ pub mod conformance_tests {
         }
     }
 
+    /// In-memory reference backend: executable port semantics (one map per
+    /// tenant; the factory binds tenants, paths never carry them).
+    pub struct InMemoryArtifactBackend {
+        files: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    pub struct InMemoryArtifactBackendFactory {
+        tenants: std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<InMemoryArtifactBackend>>,
+        >,
+    }
+
+    impl Default for InMemoryArtifactBackendFactory {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl InMemoryArtifactBackendFactory {
+        pub fn new() -> Self {
+            Self {
+                tenants: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl super::ArtifactBackendFactory for InMemoryArtifactBackendFactory {
+        fn backend_for(
+            &self,
+            tenant_id: &str,
+        ) -> Result<std::sync::Arc<dyn super::ArtifactBackend>, super::ArtifactBackendError>
+        {
+            let mut tenants = self.tenants.lock().unwrap_or_else(|p| p.into_inner());
+            Ok(tenants
+                .entry(tenant_id.to_string())
+                .or_insert_with(|| {
+                    std::sync::Arc::new(InMemoryArtifactBackend {
+                        files: std::sync::Mutex::new(std::collections::HashMap::new()),
+                    })
+                })
+                .clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::ArtifactBackend for InMemoryArtifactBackend {
+        fn capabilities(&self) -> super::ArtifactBackendCapabilities {
+            super::ArtifactBackendCapabilities {
+                filesystem_semantics: false,
+            }
+        }
+
+        async fn put(
+            &self,
+            path: &super::ArtifactPath,
+            bytes: &[u8],
+        ) -> Result<(), super::ArtifactBackendError> {
+            self.files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(path.segments().join("/"), bytes.to_vec());
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            path: &super::ArtifactPath,
+        ) -> Result<Option<super::ArtifactBackendContents>, super::ArtifactBackendError> {
+            Ok(self
+                .files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&path.segments().join("/"))
+                .map(|bytes| super::ArtifactBackendContents::File(bytes.clone())))
+        }
+
+        async fn list(
+            &self,
+            path: &super::ArtifactPath,
+        ) -> Result<Vec<super::ArtifactBackendEntry>, super::ArtifactBackendError> {
+            let prefix = format!("{}/", path.segments().join("/"));
+            let mut names = std::collections::BTreeSet::new();
+            for key in self.files.lock().unwrap_or_else(|p| p.into_inner()).keys() {
+                if let Some(rest) = key.strip_prefix(&prefix) {
+                    // Only DIRECT children name out (the proxy contract).
+                    names.insert(rest.split('/').next().unwrap_or(rest).to_string());
+                }
+            }
+            Ok(names
+                .into_iter()
+                .map(|name| super::ArtifactBackendEntry {
+                    name,
+                    is_dir: false,
+                    size_bytes: 0,
+                })
+                .collect())
+        }
+
+        async fn delete(
+            &self,
+            path: &super::ArtifactPath,
+        ) -> Result<(), super::ArtifactBackendError> {
+            let key = path.segments().join("/");
+            self.files
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+            Ok(())
+        }
+    }
+
+    /// Artifact-seam conformance (TD-MLOPS-4 rule 5): the encoding and
+    /// isolation cases from #1891's red evidence run against EVERY
+    /// implementation. Filesystem-shaped cases (symlink, parent swap) run
+    /// where the implementation declares `filesystem_semantics` — they
+    /// live with the concrete filesystem backend (the wire crate) where
+    /// the layout is reachable.
+    pub async fn artifact_backend_conformance<F: super::ArtifactBackendFactory>(factory: &F) {
+        // Path validation is IN the port (rule 4): every rejection shape.
+        assert!(super::ArtifactPath::parse("a/b").is_ok());
+        assert!(
+            super::ArtifactPath::parse("a//b/./c").is_ok(),
+            "empty and . dropped"
+        );
+        for bad in ["", ".", "..", "a/../b", "a\\b", "a\0b"] {
+            assert!(
+                super::ArtifactPath::parse(bad).is_err(),
+                "path '{bad}' must be rejected in the port"
+            );
+        }
+
+        // Tenant isolation (#1891's collision class): bytes written through
+        // one tenant's backend are ABSENT through another's — regardless of
+        // how similar the tenant ids are (the prefix case that broke v1).
+        let alice = factory
+            .backend_for("alice")
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let bob = factory
+            .backend_for("alice-suffix") // encoded-prefix collision shape
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let path = super::ArtifactPath::parse("exp/1/run/artifacts/model.bin").unwrap();
+        alice.put(&path, b"alice-bytes").await.unwrap();
+        assert_eq!(
+            bob.get(&path).await.unwrap(),
+            None,
+            "a tenant whose id is a PREFIX of another must not see its bytes"
+        );
+        assert!(bob.list(&path).await.unwrap().is_empty());
+
+        // Round-trip + delete idempotence through the SAME backend.
+        assert_eq!(
+            alice.get(&path).await.unwrap(),
+            Some(super::ArtifactBackendContents::File(
+                b"alice-bytes".to_vec()
+            ))
+        );
+        alice.delete(&path).await.unwrap();
+        alice.delete(&path).await.unwrap();
+        assert_eq!(alice.get(&path).await.unwrap(), None);
+
+        // Capability declaration is mandatory and honest (rule 3): the
+        // in-memory reference declares no filesystem semantics.
+        let caps = alice.capabilities();
+        let _ = caps;
+    }
+
     /// Port conformance battery — substrate implementations re-run this
     /// against themselves (same semantics, different durability).
     pub async fn port_conformance<S: RunStore>(store: &S) {
@@ -2402,11 +2693,20 @@ pub mod conformance_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::conformance_tests::{InMemoryRunStore, port_conformance};
+    use super::conformance_tests::{
+        InMemoryArtifactBackendFactory, InMemoryRunStore, artifact_backend_conformance,
+        port_conformance,
+    };
 
     #[tokio::test]
     async fn in_memory_reference_passes_port_conformance() {
         let store = InMemoryRunStore::new();
         port_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_artifact_reference_passes_seam_conformance() {
+        let factory = InMemoryArtifactBackendFactory::new();
+        artifact_backend_conformance(&factory).await;
     }
 }

@@ -489,7 +489,15 @@ pub(super) async fn list_directory(
     repo_path: &str,
     display_sub: &str,
 ) -> MlflowResult<Vec<Value>> {
-    let segments = sanitize_segments(repo_path)?;
+    let backend = state
+        .artifacts
+        .backend_for(&tenant.tenant_id)
+        .map_err(artifact_backend_error)?;
+    let parsed = {
+        use proximadb_catalog::run_store::ArtifactPath;
+        ArtifactPath::parse(repo_path).map_err(artifact_backend_error)?
+    };
+    let segments = parsed.segments().to_vec();
     // Paths are OWNER-ROOT-relative (MLflow FileInfo semantics — review
     // MINOR-3): the caller passes the sub-path below the owner root as
     // the display prefix, so "sub/model.bin" resolves against the
@@ -502,7 +510,18 @@ pub(super) async fn list_directory(
         Err(_) if display_sub.chars().all(|c| c == '.' || c.is_whitespace()) => String::new(),
         Err(e) => return Err(e),
     };
-    let entries = ArtifactStore::new(state, tenant)?.list(segments).await?;
+    let entries: Vec<ArtifactListEntry> = backend
+        .list(&parsed)
+        .await
+        .map_err(artifact_backend_error)?
+        .into_iter()
+        .map(|entry| ArtifactListEntry {
+            name: entry.name,
+            is_dir: entry.is_dir,
+            size: entry.size_bytes,
+        })
+        .collect();
+    let _ = &segments;
     Ok(artifact_entries_json(entries, &display))
 }
 
@@ -514,8 +533,16 @@ pub(super) async fn delete_directory(
     tenant: &TenantContext,
     path: &str,
 ) -> MlflowResult<()> {
-    let segments = sanitize_segments(path)?;
-    ArtifactStore::new(state, tenant)?.delete(segments).await
+    use proximadb_catalog::run_store::ArtifactPath;
+    let parsed = ArtifactPath::parse(path).map_err(artifact_backend_error)?;
+    let backend = state
+        .artifacts
+        .backend_for(&tenant.tenant_id)
+        .map_err(artifact_backend_error)?;
+    backend
+        .delete(&parsed)
+        .await
+        .map_err(artifact_backend_error)
 }
 
 /// Entry names for directory listings are relative to the RUN's artifact
@@ -530,23 +557,161 @@ fn list_entry_prefix(segments: &[String]) -> String {
     segments[anchor..].join("/")
 }
 
+/// The single validation home is the PORT (TD-MLOPS-4 rule 4): this
+/// delegates and adapts the error shape.
 fn sanitize_segments(path: &str) -> MlflowResult<Vec<String>> {
-    let mut out = Vec::new();
-    for segment in path.split('/') {
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." || segment.contains('\\') || segment.contains('\0') {
-            return Err(MlflowError::invalid(format!(
-                "invalid artifact path segment '{segment}'"
-            )));
-        }
-        out.push(segment.to_string());
+    use proximadb_catalog::run_store::ArtifactPath;
+    ArtifactPath::parse(path)
+        .map(|parsed| parsed.segments().to_vec())
+        .map_err(artifact_backend_error)
+}
+
+fn artifact_backend_error(
+    error: proximadb_catalog::run_store::ArtifactBackendError,
+) -> MlflowError {
+    use proximadb_catalog::run_store::ArtifactBackendError;
+    match error {
+        ArtifactBackendError::Invalid(message) => MlflowError::invalid(message),
+        ArtifactBackendError::UnsupportedPlatform(message) => MlflowError::invalid_state(message),
+        ArtifactBackendError::Internal(message) => MlflowError::internal(message),
     }
-    if out.is_empty() {
-        return Err(MlflowError::invalid("artifact path must not be empty"));
+}
+
+/// The FIRST [`ArtifactBackend`] implementation: the hardened local store
+/// from #1891, UNTOUCHED internally — the seam was extracted from it, not
+/// written beside it (TD-MLOPS-4).
+struct HardenedLocalBackend {
+    store: ArtifactStore,
+}
+
+#[async_trait::async_trait]
+impl proximadb_catalog::run_store::ArtifactBackend for HardenedLocalBackend {
+    fn capabilities(&self) -> proximadb_catalog::run_store::ArtifactBackendCapabilities {
+        // Filesystem semantics (symlink, parent swap) apply; the
+        // fs-shaped battery cases run against this concrete impl.
+        proximadb_catalog::run_store::ArtifactBackendCapabilities {
+            filesystem_semantics: true,
+        }
     }
-    Ok(out)
+
+    async fn put(
+        &self,
+        path: &proximadb_catalog::run_store::ArtifactPath,
+        bytes: &[u8],
+    ) -> Result<(), proximadb_catalog::run_store::ArtifactBackendError> {
+        self.store
+            .write(path.segments().to_vec(), bytes.to_vec())
+            .await
+            .map_err(mlflow_error_to_backend)
+    }
+
+    async fn get(
+        &self,
+        path: &proximadb_catalog::run_store::ArtifactPath,
+    ) -> Result<
+        Option<proximadb_catalog::run_store::ArtifactBackendContents>,
+        proximadb_catalog::run_store::ArtifactBackendError,
+    > {
+        use proximadb_catalog::run_store::ArtifactBackendContents;
+        match self.store.read(path.segments().to_vec()).await {
+            Ok(Some(StoredArtifact::File(bytes))) => Ok(Some(ArtifactBackendContents::File(bytes))),
+            Ok(Some(StoredArtifact::Directory(entries))) => {
+                Ok(Some(ArtifactBackendContents::Directory(
+                    entries
+                        .into_iter()
+                        .map(|entry| proximadb_catalog::run_store::ArtifactBackendEntry {
+                            name: entry.name,
+                            is_dir: entry.is_dir,
+                            size_bytes: entry.size,
+                        })
+                        .collect(),
+                )))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(mlflow_error_to_backend(error)),
+        }
+    }
+
+    async fn list(
+        &self,
+        path: &proximadb_catalog::run_store::ArtifactPath,
+    ) -> Result<
+        Vec<proximadb_catalog::run_store::ArtifactBackendEntry>,
+        proximadb_catalog::run_store::ArtifactBackendError,
+    > {
+        self.store
+            .list(path.segments().to_vec())
+            .await
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| proximadb_catalog::run_store::ArtifactBackendEntry {
+                        name: entry.name,
+                        is_dir: entry.is_dir,
+                        size_bytes: entry.size,
+                    })
+                    .collect()
+            })
+            .map_err(mlflow_error_to_backend)
+    }
+
+    async fn delete(
+        &self,
+        path: &proximadb_catalog::run_store::ArtifactPath,
+    ) -> Result<(), proximadb_catalog::run_store::ArtifactBackendError> {
+        self.store
+            .delete(path.segments().to_vec())
+            .await
+            .map_err(mlflow_error_to_backend)
+    }
+}
+
+/// Classification survives the seam: validation-class failures (unsafe
+/// paths, invalid tenants) map to Invalid so the wire re-surfaces them as
+/// 400s — the fs-semantics battery depends on the distinction.
+fn mlflow_error_to_backend(
+    error: MlflowError,
+) -> proximadb_catalog::run_store::ArtifactBackendError {
+    use proximadb_catalog::run_store::ArtifactBackendError;
+    match error.error_code() {
+        "INVALID_PARAMETER_VALUE" | "INVALID_STATE" => {
+            ArtifactBackendError::Invalid(error.to_string())
+        }
+        _ => ArtifactBackendError::Internal(error.to_string()),
+    }
+}
+
+/// Tenant-bound factory over the hardened local backend (TD-MLOPS-4
+/// rule 1: tenant identity enters ONLY here, never in paths).
+pub struct HardenedLocalBackendFactory {
+    data_dir: std::path::PathBuf,
+}
+
+impl HardenedLocalBackendFactory {
+    pub fn new(data_dir: std::path::PathBuf) -> Self {
+        Self { data_dir }
+    }
+}
+
+impl proximadb_catalog::run_store::ArtifactBackendFactory for HardenedLocalBackendFactory {
+    fn backend_for(
+        &self,
+        tenant_id: &str,
+    ) -> Result<
+        std::sync::Arc<dyn proximadb_catalog::run_store::ArtifactBackend>,
+        proximadb_catalog::run_store::ArtifactBackendError,
+    > {
+        // The tenant validation + injective encoding live in the store's
+        // construction path (unchanged from #1891).
+        let tenant_root =
+            tenant_artifact_relative_root(tenant_id).map_err(mlflow_error_to_backend)?;
+        Ok(std::sync::Arc::new(HardenedLocalBackend {
+            store: ArtifactStore {
+                data_dir: self.data_dir.clone(),
+                tenant_root,
+            },
+        }))
+    }
 }
 
 /// Encode every tenant id byte-for-byte under a clean versioned root.
@@ -586,32 +751,51 @@ async fn artifact_proxy(
     method: axum::http::Method,
     body: axum::body::Bytes,
 ) -> MlflowResult<Response> {
-    let segments = sanitize_segments(&path)?;
-    let store = ArtifactStore::new(&state, &tenant)?;
+    let parsed = {
+        use proximadb_catalog::run_store::ArtifactPath;
+        ArtifactPath::parse(&path).map_err(artifact_backend_error)?
+    };
+    let segments = parsed.segments().to_vec();
+    let backend = state
+        .artifacts
+        .backend_for(&tenant.tenant_id)
+        .map_err(artifact_backend_error)?;
 
     match method {
         axum::http::Method::PUT => {
-            store.write(segments, body.to_vec()).await?;
+            backend
+                .put(&parsed, &body)
+                .await
+                .map_err(artifact_backend_error)?;
             Ok(StatusCode::OK.into_response())
         }
         axum::http::Method::GET => {
-            let Some(artifact) = store.read(segments.clone()).await? else {
+            use proximadb_catalog::run_store::ArtifactBackendContents;
+            let Some(artifact) = backend.get(&parsed).await.map_err(artifact_backend_error)? else {
                 return Err(MlflowError::not_found(format!(
                     "artifact '{path}' does not exist"
                 )));
             };
             match artifact {
-                StoredArtifact::Directory(entries) => {
+                ArtifactBackendContents::Directory(entries) => {
                     // Directory LIST. Entry names are repo-root-relative
                     // (relative to <exp>/<run>/artifacts) — the client feeds
                     // file.path verbatim into the next remote GET.
                     let prefix = list_entry_prefix(&segments);
+                    let entries: Vec<ArtifactListEntry> = entries
+                        .into_iter()
+                        .map(|entry| ArtifactListEntry {
+                            name: entry.name,
+                            is_dir: entry.is_dir,
+                            size: entry.size_bytes,
+                        })
+                        .collect();
                     Ok(Json(json!({
                         "files": artifact_entries_json(entries, &prefix)
                     }))
                     .into_response())
                 }
-                StoredArtifact::File(bytes) => {
+                ArtifactBackendContents::File(bytes) => {
                     // Octet-stream: the proxy carries bytes; echoing the
                     // request's Accept header as Content-Type is semantically
                     // wrong and could yield an invalid MIME.
@@ -624,7 +808,10 @@ async fn artifact_proxy(
             }
         }
         axum::http::Method::DELETE => {
-            store.delete(segments).await?;
+            backend
+                .delete(&parsed)
+                .await
+                .map_err(artifact_backend_error)?;
             Ok(StatusCode::OK.into_response())
         }
         other => Err(MlflowError::invalid(format!(
@@ -651,6 +838,17 @@ pub(super) fn model_artifact_uri(experiment_id: u64, model_id: &str) -> String {
 }
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn hardened_local_backend_passes_seam_conformance() {
+        // TD-MLOPS-4 rule 5: the port battery runs against the REAL
+        // implementation, not only the in-memory double — the encoding and
+        // isolation cases from #1891's red evidence hold through the seam.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let factory = HardenedLocalBackendFactory::new(temp.path().to_path_buf());
+        proximadb_catalog::run_store::conformance_tests::artifact_backend_conformance(&factory)
+            .await;
+    }
     use super::*;
     use crate::network::middleware::tenant::TenantIdSource;
     use axum::body::Body;

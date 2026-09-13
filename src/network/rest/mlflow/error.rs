@@ -67,6 +67,20 @@ impl MlflowError {
     }
 }
 
+impl MlflowError {
+    /// The MLflow error code (for adapters preserving classification
+    /// across a port boundary).
+    pub(crate) fn error_code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl std::fmt::Display for MlflowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
 impl IntoResponse for MlflowError {
     fn into_response(self) -> Response {
         #[derive(Serialize)]
