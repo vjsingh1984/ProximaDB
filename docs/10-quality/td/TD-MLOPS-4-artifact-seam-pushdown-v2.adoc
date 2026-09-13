@@ -81,10 +81,13 @@ S2 (the artifact seam) is IMPLEMENTED: the port (ArtifactPath /
 ArtifactBackend / ArtifactBackendFactory + the conformance battery) lives
 in crates/control/proximadb-catalog/src/run_store.rs; the hardened local
 store from #1891 is the first implementation behind it (internals
-byte-for-byte); the proxy and the traces/LoggedModel flows go through
+byte-for-byte); EVERY router path (object proxy + bare-root LIST/DELETE via the
+port's root() notion) and the traces/LoggedModel flows go through
 MlflowState.artifacts (factory-injected, default = hardened local).
-Error classification (Invalid vs Internal) survives the seam so the
-fs-semantics battery still sees 400s. The battery runs against BOTH the
+Error classification survives the seam (Invalid/UnsupportedPlatform/
+NotFound/Internal), platform support is declared at backend_for BEFORE
+any I/O (rule 3), and the battery covers owner-listings, directory-GET
+lists, and root listings alongside the isolation cases. The battery runs against BOTH the
 in-memory reference and the hardened factory. S3 (pushdown re-land) and
 S1-remainder (tracked-S3 impl) remain open.
 

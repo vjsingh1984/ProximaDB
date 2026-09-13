@@ -607,6 +607,9 @@ pub enum ArtifactBackendError {
     /// The implementation cannot serve this platform (e.g. Windows
     /// fail-closed before any filesystem touch).
     UnsupportedPlatform(String),
+    /// The target vanished beneath an operation (write races, moved
+    /// roots) — preserved across the seam so the wire keeps its 404.
+    NotFound(String),
     /// Everything else — operational failures.
     Internal(String),
 }
@@ -643,9 +646,12 @@ impl ArtifactPath {
         Ok(Self { segments })
     }
 
-    /// Construct from already-trusted segments (server-minted paths).
-    pub fn from_segments(segments: &[String]) -> Result<Self, ArtifactBackendError> {
-        Self::parse(&segments.join("/"))
+    /// The tenant repo root — the ONLY way to obtain an empty path (the
+    /// bare `/artifacts?path=` listing). Parse still rejects empty input.
+    pub fn root() -> Self {
+        Self {
+            segments: Vec::new(),
+        }
     }
 
     pub fn segments(&self) -> &[String] {
@@ -1695,24 +1701,55 @@ pub mod conformance_tests {
             &self,
             path: &super::ArtifactPath,
         ) -> Result<Option<super::ArtifactBackendContents>, super::ArtifactBackendError> {
-            Ok(self
-                .files
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&path.segments().join("/"))
-                .map(|bytes| super::ArtifactBackendContents::File(bytes.clone())))
+            let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+            let key = path.segments().join("/");
+            if let Some(bytes) = files.get(&key) {
+                return Ok(Some(super::ArtifactBackendContents::File(bytes.clone())));
+            }
+            // Implicit directories: any key under this prefix makes the
+            // node a Directory of its DIRECT children (the port's
+            // GET-on-directory-LISTS contract).
+            let prefix = format!("{key}/");
+            let mut children: Vec<String> = files
+                .keys()
+                .filter_map(|k| k.strip_prefix(&prefix))
+                .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
+                .collect();
+            children.sort();
+            children.dedup();
+            if children.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(super::ArtifactBackendContents::Directory(
+                    children
+                        .into_iter()
+                        .map(|name| super::ArtifactBackendEntry {
+                            name,
+                            is_dir: false,
+                            size_bytes: 0,
+                        })
+                        .collect(),
+                )))
+            }
         }
 
         async fn list(
             &self,
             path: &super::ArtifactPath,
         ) -> Result<Vec<super::ArtifactBackendEntry>, super::ArtifactBackendError> {
-            let prefix = format!("{}/", path.segments().join("/"));
+            let joined = path.segments().join("/");
+            let prefix = if joined.is_empty() {
+                String::new()
+            } else {
+                format!("{joined}/")
+            };
             let mut names = std::collections::BTreeSet::new();
             for key in self.files.lock().unwrap_or_else(|p| p.into_inner()).keys() {
                 if let Some(rest) = key.strip_prefix(&prefix) {
                     // Only DIRECT children name out (the proxy contract).
-                    names.insert(rest.split('/').next().unwrap_or(rest).to_string());
+                    if !rest.is_empty() {
+                        names.insert(rest.split('/').next().unwrap_or(rest).to_string());
+                    }
                 }
             }
             Ok(names
@@ -1786,6 +1823,28 @@ pub mod conformance_tests {
         alice.delete(&path).await.unwrap();
         alice.delete(&path).await.unwrap();
         assert_eq!(alice.get(&path).await.unwrap(), None);
+
+        // The OWNER sees its bytes in listings, and GET on a directory
+        // LISTS (the port contract an S3 impl modeled on the reference
+        // double must uphold).
+        let nested = super::ArtifactPath::parse("exp/1/run/artifacts/a/b.bin").unwrap();
+        alice.put(&nested, b"nested").await.unwrap();
+        let parent = super::ArtifactPath::parse("exp/1/run/artifacts/a").unwrap();
+        match alice.get(&parent).await.unwrap() {
+            Some(super::ArtifactBackendContents::Directory(entries)) => {
+                assert!(
+                    entries.iter().any(|e| e.name == "b.bin"),
+                    "directory GET must list direct children: {entries:?}"
+                );
+            }
+            other => panic!("directory GET must list, got {other:?}"),
+        }
+        let root = super::ArtifactPath::root();
+        let entries = alice.list(&root).await.unwrap();
+        assert!(
+            entries.iter().any(|e| e.name == "exp"),
+            "root listing yields top-level entries: {entries:?}"
+        );
 
         // Capability declaration is mandatory and honest (rule 3): the
         // in-memory reference declares no filesystem semantics.

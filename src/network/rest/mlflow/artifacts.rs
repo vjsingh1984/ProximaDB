@@ -573,6 +573,7 @@ fn artifact_backend_error(
     match error {
         ArtifactBackendError::Invalid(message) => MlflowError::invalid(message),
         ArtifactBackendError::UnsupportedPlatform(message) => MlflowError::invalid_state(message),
+        ArtifactBackendError::NotFound(message) => MlflowError::not_found(message),
         ArtifactBackendError::Internal(message) => MlflowError::internal(message),
     }
 }
